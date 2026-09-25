@@ -1,7 +1,119 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
-<body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
-<section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:15px system-ui;max-width:1040px;margin:28px auto;padding:0 16px;color:#222}
+input,textarea,button,select{font:inherit;padding:7px;margin:3px}
+input{width:170px}
+textarea{width:100%;height:120px;box-sizing:border-box}
+.panel{border:1px solid #bbb;padding:14px 16px;border-radius:8px;margin:12px 0}
+.panel h2{margin:0 0 8px;font-size:17px}
+pre{background:#f4f4f4;padding:10px;white-space:pre-wrap;border-radius:6px;max-height:340px;overflow:auto;margin:8px 0 0}
+button{cursor:pointer;border-radius:5px;border:1px solid #888;background:#fafafa}
+button:hover{background:#eee}
+.hint{color:#666;font-size:13px;margin:4px 0}
+.gap{color:#a33}
+.ok{color:#176}
+</style></head>
+<body>
+<h1>数字档案长期保存 · 离线介质退役</h1>
+<p>演示账号：owner、archivist（可写）、auditor（只读）、outsider（无权限）。请求头 <code>X-User-Id</code>。</p>
+
+<section class="panel">
+  <h2>当前操作员</h2>
+  <select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
+  <span class="hint">退役流程：登记介质编号/存放点 → 校验完成 → 提交退役 → 查看阻塞原因。</span>
+</section>
+
+<section class="panel">
+  <h2>1. 查看版本与副本（含介质编号、状态、损坏清单、最近退役结果）</h2>
+  版本 ID <input id="verId" value="1">
+  <button onclick="showVersion()">查看版本</button>
+  <pre id="versionOut"></pre>
+</section>
+
+<section class="panel">
+  <h2>2. 副本登记介质编号与存放点</h2>
+  <div class="hint">新建副本时一并登记；已建副本可单独补登。介质编号全局唯一。</div>
+  版本 ID <input id="newCopyVer" placeholder="版本 ID" value="1">
+  存放点 <input id="newCopyLoc" placeholder="如：一号库房">
+  介质编号 <input id="newCopyMedia" placeholder="如：MEDIA-A-01">
+  <button onclick="registerNewCopy()">创建副本并登记</button><br>
+  副本 ID <input id="regCopy" placeholder="已存在副本 ID">
+  存放点 <input id="regLoc" placeholder="可选，更正存放点">
+  介质编号 <input id="regMedia" placeholder="补登介质编号">
+  <button onclick="registerExistingCopy()">补登/更正</button>
+  <pre id="registerOut"></pre>
+</section>
+
+<section class="panel">
+  <h2>3. 介质校验（校验中的介质不能批准退役）</h2>
+  副本 ID <input id="verCopy" placeholder="副本 ID">
+  <button onclick="startVerify()">开始校验</button>
+  <button onclick="completeVerify()">完成校验</button>
+  <button onclick="atomicVerify()">一次性校验</button>
+  <button onclick="loadDamage()">查看损坏清单</button>
+  <pre id="verifyOut"></pre>
+</section>
+
+<section class="panel">
+  <h2>4. 提交介质退役（按版本逐份核对异点健康副本）</h2>
+  副本 ID <input id="retireCopy" placeholder="副本 ID">
+  <button onclick="retire()">提交退役</button>
+  <button onclick="loadRetirements()">查看该副本退役记录与阻塞原因</button>
+  <pre id="retireOut"></pre>
+  <div class="hint">被拦截时仍会生成 blocked 记录；原因码：copy_verifying / media_not_registered / damage_report_missing / copy_not_healthy / no_other_healthy_copy。</div>
+</section>
+
+<section class="panel">
+  <h2>档案状态与审计（退役后原位置、介质信息与审计记录保留）</h2>
+  档案 ID <input id="archId" value="1">
+  <button onclick="loadStatus()">查看档案状态</button>
+  <pre id="statusOut"></pre>
+</section>
+
+<script>
+const $=id=>document.getElementById(id);
+function api(method,url,body){
+  return fetch(url,{method,headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"},
+    body:body?JSON.stringify(body):undefined}).then(async r=>{
+    const data=await r.json().catch(()=>({}));
+    if(!r.ok) throw Object.assign(new Error(data.error?.message||r.statusText),{status:r.status(),data});
+    return data;
+  });
+}
+function render(el,data,ok){$(el).textContent=(ok?"✅ ":"")+JSON.stringify(data,null,2)}
+function fail(el,e){
+  $(el).innerHTML="";
+  const pre=document.createElement("pre");
+  pre.className="gap";pre.textContent="⛔ "+(e.data?JSON.stringify(e.data,null,2):e.message);
+  $(el).appendChild(pre);
+}
+function showVersion(){api("GET",`/api/versions/${$("verId").value}`)
+  .then(d=>render("versionOut",d)).catch(e=>fail("versionOut",e))}
+function loadStatus(){api("GET",`/api/archives/${$("archId").value}/status`).then(d=>render("statusOut",d)).catch(e=>fail("statusOut",e))}
+
+function registerNewCopy(){
+  api("POST",`/api/versions/${$("newCopyVer").value}/copies`,
+    {storage_site:$("newCopyLoc").value,media_id:$("newCopyMedia").value})
+    .then(d=>render("registerOut",d,true)).catch(e=>fail("registerOut",e));
+}
+function registerExistingCopy(){
+  const body={};
+  if($("regLoc").value)body.storage_site=$("regLoc").value;
+  if($("regMedia").value)body.media_id=$("regMedia").value;
+  api("POST",`/api/copies/${$("regCopy").value}/register`,body)
+    .then(d=>render("registerOut",d,true)).catch(e=>fail("registerOut",e));
+}
+function startVerify(){api("POST",`/api/copies/${$("verCopy").value}/verification/start`)
+  .then(d=>render("verifyOut",d)).catch(e=>fail("verifyOut",e))}
+function completeVerify(){api("POST",`/api/copies/${$("verCopy").value}/verification/complete`)
+  .then(d=>render("verifyOut",d)).catch(e=>fail("verifyOut",e))}
+function atomicVerify(){api("POST",`/api/copies/${$("verCopy").value}/verify`)
+  .then(d=>render("verifyOut",d)).catch(e=>fail("verifyOut",e))}
+function loadDamage(){api("GET",`/api/copies/${$("verCopy").value}/damage-reports`)
+  .then(d=>render("verifyOut",d)).catch(e=>fail("verifyOut",e))}
+function retire(){api("POST",`/api/copies/${$("retireCopy").value}/retire`)
+  .then(d=>{render("retireOut",d,true)}).catch(e=>fail("retireOut",e))}
+function loadRetirements(){api("GET",`/api/copies/${$("retireCopy").value}/retirements`)
+  .then(d=>render("retireOut",d)).catch(e=>fail("retireOut",e))}
+</script>
+</body></html>
