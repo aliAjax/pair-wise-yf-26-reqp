@@ -1,7 +1,160 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
-<body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
-<section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存 · 介质退役</title>
+<style>
+body{font:15px system-ui;max-width:1040px;margin:28px auto;padding:0 16px;color:#222}
+input,textarea,button,select{font:inherit;padding:7px;margin:3px}
+textarea{width:100%;height:90px}
+.panel{border:1px solid #bbb;padding:15px;border-radius:8px;margin:12px 0}
+pre{background:#f5f5f5;padding:11px;white-space:pre-wrap;border-radius:6px;font-size:13px}
+h2{font-size:17px;margin:0 0 8px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{border:1px solid #ccc;padding:5px 7px;text-align:left;vertical-align:top}
+th{background:#eef}
+.ok{color:#0a7d2c;font-weight:600}.bad{color:#c0271a;font-weight:600}.warn{color:#9a6200;font-weight:600}
+.tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px;margin-right:4px}
+.tag-healthy{background:#d9f2e0}.tag-corrupt,.tag-degraded{background:#fbdcd8}
+.tag-verifying{background:#fdeec0}.tag-inactive{background:#e2e2e2}
+button{cursor:pointer;border-radius:5px;border:1px solid #88a;background:#f4f6ff}
+button:hover{background:#e3e8ff}
+.small{font-size:12px;color:#666}
+</style></head>
+<body>
+<h1>数字档案长期保存 · 介质退役</h1>
+<p>演示账号：<code>owner / archivist / auditor / outsider</code>。当前身份：
+<select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select></p>
+
+<section class="panel">
+  <h2>1. 查看版本与副本</h2>
+  版本 ID <input id="verId" size="5" value="1">
+  <button onclick="loadVersion()">查看版本副本</button>
+  <div id="copies"></div>
+</section>
+
+<section class="panel">
+  <h2>2. 登记介质编号与存放点</h2>
+  副本 ID <input id="regCopy" size="5">
+  介质编号 <input id="regSerial" placeholder="如 TAPE-2026-007" size="18">
+  存放点 <input id="regSite" placeholder="如 档案楼B库" size="14">
+  <button onclick="registerMedia()">登记介质</button>
+</section>
+
+<section class="panel">
+  <h2>3. 介质校验</h2>
+  副本 ID <input id="chkCopy" size="5">
+  <button onclick="startVerify()">标记校验中</button>
+  <button onclick="finishVerify()">完成校验</button>
+  <p class="small">校验中的介质不能批准退役；发现损坏会先留存损坏清单，能修复则修复，不能修复则保持停用前的阻塞状态。</p>
+</section>
+
+<section class="panel">
+  <h2>4. 提交介质退役批次</h2>
+  副本 ID 列表（逗号分隔）<input id="batchCopies" placeholder="如 1,2" size="20">
+  备注 <input id="batchNote" placeholder="2026 第三批离线介质下线" size="26">
+  <button onclick="submitBatch()">提交退役</button>
+  <p class="small">系统按版本逐份核对文件：没有另一个健康且存放点不同的副本，或介质校验中、副本损坏时，将拦下并列出缺口。</p>
+</section>
+
+<section class="panel">
+  <h2>5. 退役批次与阻塞原因</h2>
+  <button onclick="listBatches()">刷新批次列表</button>
+  批次 ID <input id="batchId" size="5"><button onclick="loadBatch()">查看批次详情</button>
+  <div id="batches"></div>
+</section>
+
+<pre id="out">操作结果将显示在这里。</pre>
+
+<script>
+const $=id=>document.getElementById(id);
+const out=$("out");
+function show(v){out.textContent=typeof v==="string"?v:JSON.stringify(v,null,2)}
+async function api(path,method="GET",body){
+  const opt={method,headers:{"X-User-Id":$("user").value}};
+  if(body){opt.headers["Content-Type"]="application/json";opt.body=JSON.stringify(body)}
+  const r=await fetch(path,opt);
+  const data=await r.json();
+  if(!r.ok)throw data.error||{message:r.status};
+  return data;
+}
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const stateClass=s=>s==="healthy"?"tag-healthy":(s==="corrupt"||s==="degraded")?"tag-corrupt":"tag-healthy";
+
+async function loadVersion(){
+  try{
+    const d=await api(`/api/versions/${$("verId").value}`);
+    let h=`<table><tr><th>副本ID</th><th>位置</th><th>介质编号</th><th>存放点</th><th>状态</th><th>损坏清单</th></tr>`;
+    for(const c of d.copies){
+      const tags=[];
+      if(!c.active)tags.push(`<span class="tag tag-inactive">已停用 ${esc(c.deactivated_at)}</span>`);
+      if(c.verifying)tags.push(`<span class="tag tag-verifying">校验中</span>`);
+      tags.push(`<span class="tag ${stateClass(c.state)}">${esc(c.state)}</span>`);
+      h+=`<tr><td>${c.id}</td><td>${esc(c.location)}</td><td>${esc(c.media_serial||"—未登记—")}</td>
+      <td>${esc(c.storage_site||"—未登记—")}</td><td>${tags.join(" ")}</td>
+      <td>${c.damage_count?`<span class="bad">${c.damage_count} 项未修复</span>`:"无"}</td></tr>`;
+    }
+    h+="</table>";
+    $("copies").innerHTML=h;
+    show(d);
+  }catch(e){show(e)}
+}
+
+async function registerMedia(){
+  try{
+    const d=await api(`/api/copies/${$("regCopy").value}/media`,"POST",
+      {media_serial:$("regSerial").value,storage_site:$("regSite").value});
+    show({ok:"介质已登记",copy:d});
+    loadVersion();
+  }catch(e){show(e)}
+}
+async function startVerify(){
+  try{show(await api(`/api/copies/${$("chkCopy").value}/start-verification`,"POST"));loadVersion()}catch(e){show(e)}
+}
+async function finishVerify(){
+  try{show(await api(`/api/copies/${$("chkCopy").value}/verify`,"POST"));loadVersion()}catch(e){show(e)}
+}
+
+async function submitBatch(){
+  const ids=$("batchCopies").value.split(",").map(x=>parseInt(x.trim(),10)).filter(Boolean);
+  try{show(await api("/api/decommissions","POST",{copy_ids:ids,note:$("batchNote").value}));listBatches()}
+  catch(e){show(e)}
+}
+
+function reasonHtml(reasons){
+  return reasons.map(r=>{
+    let s=`<div><span class="bad">${esc(r.code)}</span>：${esc(r.message)}`;
+    if(r.gaps){s+="<ul>"+r.gaps.map(g=>`<li>缺口文件 <code>${esc(g.path)}</code>（${esc(g.reason)}，sha256 ${esc(g.sha256.slice(0,12))}…）</li>`).join("")+"</ul>"}
+    if(r.damage_list){s+="<ul>"+r.damage_list.map(g=>`<li>损坏 <code>${esc(g.path)}</code> 期望 ${esc(g.expected_sha256.slice(0,12))}… 实际 ${esc((g.found_sha256||"缺失").slice(0,12))}</li>`).join("")+"</ul>"}
+    return s+"</div>";
+  }).join("");
+}
+
+async function loadBatch(){
+  try{
+    const d=await api(`/api/decommissions/${$("batchId").value}`);
+    let h=`<p>批次 ${d.id}：<b class="${d.state==="approved"?"ok":"bad"}">${d.state==="approved"?"全部批准":"存在阻塞"}</b>
+      （批准 ${d.approved_count} / 拦下 ${d.blocked_count}） 提交人 ${esc(d.created_by)} ${esc(d.created_at)}</p><table>
+      <tr><th>副本</th><th>介质/存放点</th><th>结果</th><th>阻塞原因 / 缺口</th></tr>`;
+    for(const it of d.items){
+      h+=`<tr><td>副本 ${it.copy_id}<br><span class="small">版本 ${it.version_id}<br>原位置 ${esc(it.copy?.location)}</span></td>
+      <td>${esc(it.copy?.media_serial||"—")}<br>${esc(it.copy?.storage_site||"—")}</td>
+      <td class="${it.outcome==="approved"?"ok":"bad"}">${it.outcome==="approved"?"批准停用":"拦下"}</td>
+      <td>${it.reasons.length?reasonHtml(it.reasons):"无"}</td></tr>`;
+    }
+    $("batches").innerHTML=h+"</table>";
+    show(d);
+  }catch(e){show(e)}
+}
+
+async function listBatches(){
+  try{
+    const d=await api("/api/decommissions");
+    let h="<table><tr><th>批次</th><th>提交</th><th>备注</th><th>状态</th><th>副本结果</th></tr>";
+    for(const b of d.batches){
+      h+=`<tr><td><a href="#" onclick="$('batchId').value=${b.id};loadBatch();return false">${b.id}</a></td>
+      <td>${esc(b.created_by)}<br><span class="small">${esc(b.created_at)}</span></td><td>${esc(b.note)}</td>
+      <td class="${b.state==="approved"?"ok":"bad"}">${b.state==="approved"?"approved":"blocked"}</td>
+      <td>${b.items.map(i=>`#${i.copy_id} <span class="${i.outcome==="approved"?"ok":"bad"}">${i.outcome}</span>`).join("<br>")}</td></tr>`;
+    }
+    $("batches").innerHTML=h+"</table>";
+  }catch(e){show(e)}
+}
+loadVersion();listBatches();
+</script></body></html>
